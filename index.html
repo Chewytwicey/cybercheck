@@ -30,6 +30,14 @@
   .logo { font-family: var(--mono); font-size: 14px; font-weight: 700; letter-spacing: 0.08em; color: var(--accent); }
   .logo span { color: var(--muted); font-weight: 400; }
   .nav-tag { font-family: var(--mono); font-size: 11px; color: var(--muted); border: 1px solid var(--border2); padding: 4px 10px; border-radius: 4px; }
+  .geo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 1px; background: var(--border); }
+  .geo-cell { background: var(--surface); padding: 12px 14px; }
+  .geo-flag { font-size: 18px; margin-bottom: 4px; }
+  .geo-country { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 2px; }
+  .geo-status-ok { font-size: 11px; color: var(--accent); font-family: var(--mono); }
+  .geo-status-fail { font-size: 11px; color: var(--danger); font-family: var(--mono); }
+  .geo-status-slow { font-size: 11px; color: var(--warn); font-family: var(--mono); }
+  .geo-status-pending { font-size: 11px; color: var(--muted); font-family: var(--mono); }
   .main { flex: 1; max-width: 820px; margin: 0 auto; width: 100%; padding: 48px 24px 80px; }
   .hero { margin-bottom: 40px; }
   .hero h1 { font-family: var(--mono); font-size: clamp(24px, 4vw, 36px); font-weight: 700; line-height: 1.1; border-left: 3px solid var(--accent); padding-left: 16px; }
@@ -98,13 +106,13 @@
 
 <nav class="navbar">
   <div class="logo">CYBER<span>CHECK</span></div>
-  <div class="nav-tag">URL ANALYZER v2.0 — NO API NEEDED</div>
+  <div class="nav-tag">URL ANALYZER v2.1 — NO API NEEDED</div>
 </nav>
 
 <main class="main">
   <div class="hero">
     <h1>URL <em>Threat</em><br>Analyzer</h1>
-    <p>No API key needed · 100% free · checks mobile · hidden paths · DNS · SSL · domain age · redirects</p>
+    <p>No API key needed · 100% free · checks mobile · hidden paths · DNS · SSL · domain age · redirects · geo-access</p>
   </div>
 
   <div class="url-row">
@@ -257,7 +265,67 @@ async function checkRedirect(url) {
   } catch { return { hasRedirect: false, finalUrl: url }; }
 }
 
-// ── RISK SCORING ─────────────────────────────────────────────────
+// 8. Geo-access check via check-host.net (free, no key)
+// Tests if site is reachable from multiple countries
+const GEO_NODES = [
+  { id: 'in1.node.check-host.net', country: 'India', flag: '🇮🇳' },
+  { id: 'us1.node.check-host.net', country: 'USA', flag: '🇺🇸' },
+  { id: 'de1.node.check-host.net', country: 'Germany', flag: '🇩🇪' },
+  { id: 'ru1.node.check-host.net', country: 'Russia', flag: '🇷🇺' },
+  { id: 'jp1.node.check-host.net', country: 'Japan', flag: '🇯🇵' },
+  { id: 'sg1.node.check-host.net', country: 'Singapore', flag: '🇸🇬' },
+  { id: 'uk1.node.check-host.net', country: 'UK', flag: '🇬🇧' },
+  { id: 'au1.node.check-host.net', country: 'Australia', flag: '🇦🇺' },
+];
+
+async function checkGeoAccess(url) {
+  try {
+    const domain = getDomain(url);
+    const nodeParams = GEO_NODES.map(n => `node=${n.id}`).join('&');
+    const apiUrl = `https://check-host.net/check-http?host=${encodeURIComponent(domain)}&${nodeParams}&max_nodes=8`;
+    const r = await fetch(apiUrl, {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000)
+    });
+    const d = await r.json();
+    const requestId = d.request_id;
+    if (!requestId) return { results: [], geoRestricted: false };
+
+    // Wait 6 seconds for nodes to respond
+    await new Promise(res => setTimeout(res, 6000));
+
+    const res2 = await fetch(`https://check-host.net/check-result/${requestId}`, {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(8000)
+    });
+    const results = await res2.json();
+
+    const geoResults = GEO_NODES.map(node => {
+      const key = node.id;
+      const nodeData = results[key];
+      let status = 'unknown', time = null;
+      if (nodeData && nodeData[0]) {
+        const r = nodeData[0];
+        if (r[0] === 1) { status = 'ok'; time = r[1] ? Math.round(r[1] * 1000) : null; }
+        else if (r[0] === 0) status = 'fail';
+        else status = 'timeout';
+      }
+      return { ...node, status, time };
+    });
+
+    const okCount = geoResults.filter(r => r.status === 'ok').length;
+    const failCount = geoResults.filter(r => r.status === 'fail' || r.status === 'timeout').length;
+    const geoRestricted = okCount > 0 && failCount > okCount;
+
+    return { results: geoResults, geoRestricted, okCount, failCount };
+  } catch {
+    // Fallback: just do DNS checks per region isn't possible without proxy
+    // Return empty so we don't crash
+    return { results: [], geoRestricted: false, error: true };
+  }
+}
+
+
 function scoreRisk(data) {
   let score = 0;
   const factors = [];
@@ -296,7 +364,15 @@ function scoreRisk(data) {
   // Redirect detected
   if (data.redirect?.hasRedirect) { score += 10; factors.push(`Redirect detected → ${data.redirect.finalUrl}`); }
 
-  score = Math.min(100, score);
+  // Geo restricted
+  if (data.geo?.geoRestricted) { score += 20; factors.push(`Site appears geo-restricted — only reachable from ${data.geo.okCount} of 8 regions tested`); }
+  if (data.geo?.results?.length > 0) {
+    const indiaResult = data.geo.results.find(r => r.country === 'India');
+    const usResult = data.geo.results.find(r => r.country === 'USA');
+    if (indiaResult?.status === 'ok' && usResult?.status !== 'ok') {
+      score += 15; factors.push('Site accessible from India but not USA — common pattern for region-targeted scams');
+    }
+  }
   return { score, factors };
 }
 
@@ -345,6 +421,20 @@ function renderResults(data, url) {
         ${data.ipInfo.hosting ? `<div style="margin-top:4px;"><span class="badge bw">DATACENTER / VPS</span></div>` : ''}
       </div>
     </div>` : '';
+
+  const geoHtml = data.geo?.results?.length > 0
+    ? `<div class="geo-grid">${data.geo.results.map(r => {
+        const sc = r.status === 'ok' ? 'geo-status-ok' : r.status === 'fail' ? 'geo-status-fail' : 'geo-status-slow';
+        const st = r.status === 'ok' ? `✓ reachable${r.time ? ' · ' + r.time + 'ms' : ''}` : r.status === 'fail' ? '✗ blocked / unreachable' : '? timeout';
+        return `<div class="geo-cell"><div class="geo-flag">${r.flag}</div><div class="geo-country">${r.country}</div><div class="${sc}">${st}</div></div>`;
+      }).join('')}</div>`
+    : `<div class="row"><div class="row-detail" style="color:var(--muted)">Could not reach check-host.net — try again or check manually at check-host.net</div></div>`;
+
+  const geoSummary = data.geo?.geoRestricted
+    ? `<span class="badge bw">GEO-RESTRICTED</span> Only reachable from ${data.geo.okCount}/8 regions`
+    : data.geo?.results?.length > 0
+      ? `<span class="badge bp">GLOBALLY REACHABLE</span> ${data.geo.okCount}/8 regions responded OK`
+      : `<span class="badge bi">UNKNOWN</span>`;
 
   return `
     <div class="risk-banner ${rc}">
@@ -416,6 +506,18 @@ function renderResults(data, url) {
       <div class="card-header"><div class="dot"></div>RISK FACTORS</div>
       ${factorsHtml}
     </div>
+
+    <div class="card">
+      <div class="card-header"><div class="dot"></div>GEO-ACCESS CHECK — IS A VPN NEEDED?</div>
+      <div class="row">
+        <div class="row-icon">🗺️</div>
+        <div class="row-content">
+          <div class="row-label">${geoSummary}</div>
+          <div class="row-detail" style="margin-top:6px;">Tests if the site is reachable from 8 countries. If it only works from certain regions, a VPN may be needed — or it may be a geo-targeted scam.</div>
+        </div>
+      </div>
+      ${geoHtml}
+    </div>
   `;
 }
 
@@ -454,6 +556,9 @@ async function analyze() {
 
   setStatus('Probing hidden paths');
   data.paths = await Promise.all(HIDDEN_PATHS.map(p => checkPath(url, p)));
+
+  setStatus('Checking geo-access from 8 countries (this takes ~8s)');
+  data.geo = await checkGeoAccess(url);
 
   setStatus('');
   resultsEl.innerHTML = renderResults(data, url);
